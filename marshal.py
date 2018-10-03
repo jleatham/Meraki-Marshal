@@ -20,24 +20,35 @@ parameters.ini should include:
 [access]
 key = 1234|YOUR-APIKEY|5678
 org = 12|ORGID|34
+
+=== OUTPUT ===
+marshal_log...csv   #shows all API calls and errors
+rogue...csv         #final report, formatted, time stamped
+temp_rogue...csv    # in case timeouts or errors, csv will include what it can.  Is deleted on 
+                    # successful completion of rogue..csv file
 '''
 
 
 import configparser
 import csv
+import os
+import sys
 from datetime import datetime
-import getopt
+#import getopt
 import logging
 from meraki import meraki
 import requests
-import sys
-from pprint import pprint
 import time
 import pandas as pd
 
 
 
 
+
+
+#change the format from pandas to_csv -> to csvwriter
+#this will allow for easier writing to CSV during the iteration, as opposed to
+#writing the CSV file all at once, which is error prone
 def main(api_key, org_id):
     # Get the org's inventory
     inventory = meraki.getorginventory(api_key, org_id, suppressprint=True)
@@ -54,38 +65,70 @@ def main(api_key, org_id):
     logger.info('Preparing the output file. Check your local directory.')
     timenow = '{:%Y%m%d_%H%M%S}'.format(datetime.now())
     filename = 'rogues_{0}.csv'.format(timenow)
+    #####Added CSV writer so that CSV file would write while performing API iteration
+    ##### Helps for when there are unexpected crashes or timeouts, we can still have some data
+    temp_filename = 'temp_rogues_{0}.csv'.format(timenow)
+    output_file = open(temp_filename, mode='w', newline='\n')
+    field_names = ['SSID','Channels','Device SN','Network ID','First Seen','Last Seen','Plugged in Time']
+    csv_writer = csv.DictWriter(output_file, fieldnames=field_names, restval='')
+    csv_writer.writeheader()
+    ###### End CSV init
+    n = 1000  #used to print screen every n rogue ID found
+    x = 0
+    
 
 
     for ap in aps:
         #iterate through all network IDs and store each temporarily in roguedata
-        roguedata = meraki.getairmarshal(api_key, ap['networkId'], 10800, suppressprint=True)
+        try:
+            #print(str(ap))
+            roguedata = meraki.getairmarshal(api_key, ap['networkId'], 3600, suppressprint=True)
+            #go through each rogue SSID per Network ID
+            for rogue in roguedata:
+                if 'ssid' in rogue: #skip if no data
 
-        #go through each rogue SSID per Network ID
-        for rogue in roguedata:
-            if 'ssid' in rogue: #skip if no data
+                    ssidName  = data_value(rogue, 'ssid')
+                    channels  = data_value(rogue, 'channels')
+                    deviceSN  = data_value2(rogue, 'bssids','detectedBy','device')
+                    networkID = get_network_id(networkList,data_value2(rogue, 'bssids','detectedBy','device'))
+                    firstSeen = data_value(rogue, 'firstSeen')
+                    lastSeen  = data_value(rogue, 'lastSeen')
+                    wiredLast = data_value(rogue, 'wiredLastSeen')
+                    
+                    #Write CSV data row by row
+                    data={'SSID':ssidName,'Channels':channels,'Device SN':deviceSN,'Network ID':networkID,'First Seen':firstSeen,'Last Seen':lastSeen,'Plugged in Time':wiredLast}
+                    csv_writer.writerow(data)
+                    #output to screen every n iterations of CSV lines
+                    if x % n == 0:
+                        logger.info("Processing Rogue SSIDs.  Count = {0}".format(str(x)))
+                        #print("Processing Rogue SSIDs.  Count = "+str(x))
+                x += 1
 
-                ssidName  = data_value(rogue, 'ssid')
-                channels  = data_value(rogue, 'channels')
-                deviceSN  = data_value2(rogue, 'bssids','detectedBy','device')
-                networkID = get_network_id(networkList,data_value2(rogue, 'bssids','detectedBy','device'))
-                firstSeen = data_value(rogue, 'firstSeen')
-                lastSeen  = data_value(rogue, 'lastSeen')
-                wiredLast = data_value(rogue, 'wiredLastSeen')
-                
-                df = pd.DataFrame(data={'SSID':[ssidName],'Channels':[channels],'Device SN':[deviceSN],'Network ID':[networkID],'First Seen':[firstSeen],'Last Seen':[lastSeen],'Plugged in Time':[wiredLast]})
-                frames.append(df)
+
+        except Exception as e:
+            print (e)
+            logger.error("Problem with AP:   {0}".format(str(ap)))
+            #print("\nProblem with AP: \n"+ str(ap))
     
     
     
-    master_df = pd.concat(frames, axis=0, ignore_index=True) #join all rows together
-    master_df = add_network_name(master_df,api_key) 
-    master_df = convert_dates(master_df)
-    #reorder data
+    output_file.close() #close out temp_rogue file
+    #print("Adding Network names to CSV file")
+    logger.info("Adding Network names to CSV file")
+    master_df = pd.read_csv(temp_filename)   #reopen temp csv and import to pandas for processing
+    master_df = add_network_name(master_df,api_key)  #get network name associated to each AP ID
+    master_df = convert_dates(master_df)    #format DateTime to be consistent and readable
+    #reorder CSV data
     master_df = master_df[['Network Name','SSID','Channels','Device SN','Network ID','First Seen','Last Seen','Plugged in Time']]
     master_df = master_df.reset_index(drop=True) #drop dataframe index
-    master_df = master_df.sort_values(['Network Name'])
-    master_df.to_csv(filename,index=False)  #write to CSV
-
+    master_df = master_df.sort_values(['Network Name'])  #sort CSV by network name
+    master_df.to_csv(filename,index=False)  #write to final rogue CSV file
+    #remove temp CSV file because final report was generated
+    if os.path.exists(temp_filename):
+        os.remove(temp_filename)
+    else:
+        #print("The file does not exist") 
+        logger.error("The temp CSV file does not exist")   
 
 
 
@@ -133,7 +176,6 @@ def read_config():
         org_id = cp.get('access', 'org')
     except:
         print_help()
-        print('blah blah')
         sys.exit(2)
     return api_key, org_id
 
@@ -222,7 +264,6 @@ if __name__ == '__main__':
     # Finish output to logfile/console
     end_time = datetime.now()
     end = int(time.time())
-    print('done')
     logger.info('Ended script at {0}'.format(end_time))
     d = divmod(end - start,86400)  # days
     h = divmod(d[1],3600)  # hours
